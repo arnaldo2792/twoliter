@@ -138,10 +138,11 @@ pub(crate) async fn run(args: &Args, ssm_args: &SsmArgs) -> Result<()> {
 
     // If the path to an output file was given, write the rendered parameters to this file
     if let Some(ssm_parameter_output) = &ssm_args.ssm_parameter_output {
-        write_rendered_parameters(
-            ssm_parameter_output,
-            &RenderedParametersMap::from(&new_parameters).rendered_parameters,
-        )?;
+        let parameters = new_parameters
+            .iter()
+            .map(|p| (p.ssm_key.clone(), p.value.clone()))
+            .collect::<HashMap<SsmKey, String>>();
+        append_rendered_parameters(ssm_parameter_output, &parameters).await?;
     }
 
     // Generate AWS Clients to use for the updates.

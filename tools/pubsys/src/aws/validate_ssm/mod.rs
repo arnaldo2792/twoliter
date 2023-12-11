@@ -7,6 +7,7 @@ use self::results::{SsmValidationResult, SsmValidationResultStatus, SsmValidatio
 use super::ssm::ssm::get_parameters_by_prefix;
 use super::ssm::{SsmKey, SsmParameters};
 use crate::aws::client::build_client_config;
+use crate::aws::ssm::parse_parameters;
 use crate::Args;
 use aws_sdk_ssm::{config::Region, Client as SsmClient};
 use clap::Parser;
@@ -63,7 +64,11 @@ pub async fn validate(
 
     // Parse the file holding expected parameters
     info!("Parsing expected parameters file");
-    let expected_parameters = parse_parameters(&validate_ssm_args.expected_parameters_path).await?;
+    let expected_parameters = parse_parameters(&validate_ssm_args.expected_parameters_path)
+        .await
+        .context(error::ParseSsmParametersSnafu {
+            path: &validate_ssm_args.expected_parameters_path,
+        })?;
 
     info!("Parsed expected parameters file");
 
@@ -196,49 +201,6 @@ pub(crate) fn validate_parameters_in_region(
     }
 }
 
-type RegionName = String;
-type ParameterName = String;
-type ParameterValue = String;
-
-/// Parse the file holding expected parameters. Return a HashMap of Region mapped to a HashMap
-/// of the parameters in that region, with each parameter being a mapping of `SsmKey` to its
-/// value as `String`.
-pub(crate) async fn parse_parameters(
-    expected_parameters_file: &PathBuf,
-) -> Result<HashMap<Region, HashMap<SsmKey, String>>> {
-    let file_bytes = fs::read(expected_parameters_file.clone()).await.context(
-        error::ReadExpectedParameterFileSnafu {
-            path: expected_parameters_file,
-        },
-    )?;
-    // Parse the JSON file as a HashMap of region_name, mapped to a HashMap of parameter_name and
-    // parameter_value
-    let expected_parameters: HashMap<RegionName, HashMap<ParameterName, ParameterValue>> =
-        serde_json::from_slice(&file_bytes).context(error::ParseExpectedParameterFileSnafu)?;
-
-    // Iterate over the parsed HashMap, converting the nested HashMap into a HashMap of Region
-    // mapped to a HashMap of SsmKey, String
-    let parameter_map = expected_parameters
-        .into_iter()
-        .map(|(region, parameters)| {
-            (
-                Region::new(region.clone()),
-                parameters
-                    .into_iter()
-                    .map(|(parameter_name, parameter_value)| {
-                        (
-                            SsmKey::new(Region::new(region.clone()), parameter_name),
-                            parameter_value,
-                        )
-                    })
-                    .collect::<HashMap<SsmKey, String>>(),
-            )
-        })
-        .collect();
-
-    Ok(parameter_map)
-}
-
 /// Common entrypoint from main()
 pub(crate) async fn run(args: &Args, validate_ssm_args: &ValidateSsmArgs) -> Result<()> {
     let results = validate(args, validate_ssm_args).await?;
@@ -256,7 +218,7 @@ pub(crate) async fn run(args: &Args, validate_ssm_args: &ValidateSsmArgs) -> Res
 }
 
 pub(crate) mod error {
-    use crate::aws::ssm::ssm;
+    use crate::aws::ssm;
     use snafu::Snafu;
     use std::path::PathBuf;
 
@@ -266,17 +228,18 @@ pub(crate) mod error {
         #[snafu(display("Error reading config: {}", source))]
         Config { source: pubsys_config::Error },
 
-        #[snafu(display("Failed to fetch parameters from SSM: {}", source))]
-        FetchSsm { source: ssm::error::Error },
-
         #[snafu(display("Infra.toml is missing {}", missing))]
         MissingConfig { missing: String },
 
         #[snafu(display("Failed to validate SSM parameters: {}", missing))]
         ValidateSsm { missing: String },
 
-        #[snafu(display("Failed to parse expected parameters file: {}", source))]
-        ParseExpectedParameterFile { source: serde_json::Error },
+        #[snafu(display(
+            "Failed to parse existing SSM parameters at path {:?}: {}",
+            path,
+            source,
+        ))]
+        ParseSsmParameters { source: ssm::Error, path: PathBuf },
 
         #[snafu(display("Failed to read expected parameters file: {}", path.display()))]
         ReadExpectedParameterFile {

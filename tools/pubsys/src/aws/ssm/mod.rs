@@ -29,6 +29,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
 };
+use tokio::fs;
 
 /// Sets SSM parameters based on current build information
 #[derive(Debug, Parser)]
@@ -249,6 +250,103 @@ pub(crate) fn write_rendered_parameters(
         ssm_parameters_output
     );
     Ok(())
+}
+
+/// Read parameters in given file, add newly promoted parameters, and write combined parameters to
+/// the given file
+pub(crate) async fn append_rendered_parameters(
+    ssm_parameters_output: &PathBuf,
+    set_parameters: &HashMap<SsmKey, String>,
+) -> Result<()> {
+    // If the file doesn't exist, assume that there are no existing parameters
+    let parsed_parameters = parse_parameters(&ssm_parameters_output.to_owned())
+        .await
+        .or_else({
+            |e| match e {
+                error::Error::ReadExpectedParameterFile { .. } => Ok(HashMap::new()),
+                _ => Err(e),
+            }
+        })?
+        // SsmKey contains region information, so we can lose the top-level region.
+        .into_values()
+        .fold(HashMap::new(), |mut acc, params| {
+            acc.extend(params);
+            acc
+        });
+
+    let combined_parameters = merge_parameters(parsed_parameters, set_parameters);
+
+    write_rendered_parameters(
+        ssm_parameters_output,
+        &RenderedParametersMap::from(combined_parameters).rendered_parameters,
+    )
+}
+
+type RegionName = String;
+type ParameterName = String;
+type ParameterValue = String;
+
+/// Parse the file holding expected parameters. Return a HashMap of Region mapped to a HashMap
+/// of the parameters in that region, with each parameter being a mapping of `SsmKey` to its
+/// value as `String`.
+pub(crate) async fn parse_parameters(
+    expected_parameters_file: &PathBuf,
+) -> Result<HashMap<Region, HashMap<SsmKey, String>>> {
+    let file_bytes = fs::read(expected_parameters_file.clone()).await.context(
+        error::ReadExpectedParameterFileSnafu {
+            path: expected_parameters_file,
+        },
+    )?;
+    // Parse the JSON file as a HashMap of region_name, mapped to a HashMap of parameter_name and
+    // parameter_value
+    let expected_parameters: HashMap<RegionName, HashMap<ParameterName, ParameterValue>> =
+        serde_json::from_slice(&file_bytes).context(error::ParseExpectedParameterFileSnafu)?;
+
+    // Iterate over the parsed HashMap, converting the nested HashMap into a HashMap of Region
+    // mapped to a HashMap of SsmKey, String
+    let parameter_map = expected_parameters
+        .into_iter()
+        .map(|(region, parameters)| {
+            (
+                Region::new(region.clone()),
+                parameters
+                    .into_iter()
+                    .map(|(parameter_name, parameter_value)| {
+                        (
+                            SsmKey::new(Region::new(region.clone()), parameter_name),
+                            parameter_value,
+                        )
+                    })
+                    .collect::<HashMap<SsmKey, String>>(),
+            )
+        })
+        .collect();
+
+    Ok(parameter_map)
+}
+
+/// Return a HashMap of Region mapped to a HashMap of SsmKey, String pairs, representing the newly
+/// promoted parameters as well as the original parameters. In case of a parameter collision,
+/// the parameter takes the promoted value.
+fn merge_parameters(
+    source_parameters: HashMap<SsmKey, String>,
+    set_parameters: &HashMap<SsmKey, String>,
+) -> HashMap<Region, HashMap<SsmKey, String>> {
+    let mut combined_parameters = HashMap::new();
+
+    source_parameters
+        .into_iter()
+        // Process the `set_parameters` second so that they overwrite existing values.
+        .chain(set_parameters.clone())
+        .for_each(|(ssm_key, ssm_value)| {
+            combined_parameters
+                // The `entry()` API demands that we clone
+                .entry(ssm_key.region.clone())
+                .or_insert(HashMap::new())
+                .insert(ssm_key, ssm_value);
+        });
+
+    combined_parameters
 }
 
 // Rate limits on the EC2 side use the TokenBucket method, and buckets refill at a rate of 20 tokens per second.
@@ -530,6 +628,17 @@ mod error {
             source: serde_json::Error,
         },
 
+        #[snafu(display("Failed to parse expected parameters file: {}", source))]
+        ParseExpectedParameterFile {
+            source: serde_json::Error,
+        },
+
+        #[snafu(display("Failed to read expected parameters file: {}", path.display()))]
+        ReadExpectedParameterFile {
+            source: std::io::Error,
+            path: PathBuf,
+        },
+
         #[snafu(display("Failed to write rendered SSM parameters to {:#?}: {}", path, source))]
         WriteRenderedSsmParameters {
             path: PathBuf,
@@ -539,3 +648,181 @@ mod error {
 }
 pub(crate) use error::Error;
 type Result<T> = std::result::Result<T, error::Error>;
+
+#[cfg(test)]
+mod test {
+    use super::merge_parameters;
+    use crate::aws::ssm::SsmKey;
+    use aws_sdk_ssm::config::Region;
+    use std::collections::HashMap;
+
+    #[test]
+    fn combined_parameters() {
+        let existing_parameters = HashMap::from([
+            (
+                SsmKey::new(Region::new("us-west-2"), "test1-parameter-name".to_string()),
+                "test1-parameter-value".to_string(),
+            ),
+            (
+                SsmKey::new(Region::new("us-west-2"), "test2-parameter-name".to_string()),
+                "test2-parameter-value".to_string(),
+            ),
+            (
+                SsmKey::new(Region::new("us-east-1"), "test3-parameter-name".to_string()),
+                "test3-parameter-value".to_string(),
+            ),
+            (
+                SsmKey::new(
+                    Region::new("us-east-1"),
+                    "test4-unpromoted-parameter-name".to_string(),
+                ),
+                "test4-unpromoted-parameter-value".to_string(),
+            ),
+        ]);
+        let set_parameters = HashMap::from([
+            (
+                SsmKey::new(
+                    Region::new("us-west-2"),
+                    "test1-parameter-name-promoted".to_string(),
+                ),
+                "test1-parameter-value".to_string(),
+            ),
+            (
+                SsmKey::new(
+                    Region::new("us-west-2"),
+                    "test2-parameter-name-promoted".to_string(),
+                ),
+                "test2-parameter-value".to_string(),
+            ),
+            (
+                SsmKey::new(
+                    Region::new("us-east-1"),
+                    "test3-parameter-name-promoted".to_string(),
+                ),
+                "test3-parameter-value".to_string(),
+            ),
+        ]);
+        let map = merge_parameters(existing_parameters, &set_parameters);
+        let expected_map = HashMap::from([
+            (
+                Region::new("us-west-2"),
+                HashMap::from([
+                    (
+                        SsmKey::new(Region::new("us-west-2"), "test1-parameter-name".to_string()),
+                        "test1-parameter-value".to_string(),
+                    ),
+                    (
+                        SsmKey::new(Region::new("us-west-2"), "test2-parameter-name".to_string()),
+                        "test2-parameter-value".to_string(),
+                    ),
+                    (
+                        SsmKey::new(
+                            Region::new("us-west-2"),
+                            "test1-parameter-name-promoted".to_string(),
+                        ),
+                        "test1-parameter-value".to_string(),
+                    ),
+                    (
+                        SsmKey::new(
+                            Region::new("us-west-2"),
+                            "test2-parameter-name-promoted".to_string(),
+                        ),
+                        "test2-parameter-value".to_string(),
+                    ),
+                ]),
+            ),
+            (
+                Region::new("us-east-1"),
+                HashMap::from([
+                    (
+                        SsmKey::new(Region::new("us-east-1"), "test3-parameter-name".to_string()),
+                        "test3-parameter-value".to_string(),
+                    ),
+                    (
+                        SsmKey::new(
+                            Region::new("us-east-1"),
+                            "test3-parameter-name-promoted".to_string(),
+                        ),
+                        "test3-parameter-value".to_string(),
+                    ),
+                    (
+                        SsmKey::new(
+                            Region::new("us-east-1"),
+                            "test4-unpromoted-parameter-name".to_string(),
+                        ),
+                        "test4-unpromoted-parameter-value".to_string(),
+                    ),
+                ]),
+            ),
+        ]);
+        assert_eq!(map, expected_map);
+    }
+
+    #[test]
+    fn combined_parameters_overwrite() {
+        let existing_parameters = HashMap::from([
+            (
+                SsmKey::new(Region::new("us-west-2"), "test1-parameter-name".to_string()),
+                "test1-parameter-value".to_string(),
+            ),
+            (
+                SsmKey::new(Region::new("us-west-2"), "test2-parameter-name".to_string()),
+                "test2-parameter-value".to_string(),
+            ),
+            (
+                SsmKey::new(Region::new("us-east-1"), "test3-parameter-name".to_string()),
+                "test3-parameter-value".to_string(),
+            ),
+        ]);
+        let set_parameters = HashMap::from([
+            (
+                SsmKey::new(Region::new("us-west-2"), "test1-parameter-name".to_string()),
+                "test1-parameter-value-new".to_string(),
+            ),
+            (
+                SsmKey::new(Region::new("us-west-2"), "test2-parameter-name".to_string()),
+                "test2-parameter-value-new".to_string(),
+            ),
+            (
+                SsmKey::new(
+                    Region::new("us-east-1"),
+                    "test3-parameter-name-promoted".to_string(),
+                ),
+                "test3-parameter-value".to_string(),
+            ),
+        ]);
+        let map = merge_parameters(existing_parameters, &set_parameters);
+        let expected_map = HashMap::from([
+            (
+                Region::new("us-west-2"),
+                HashMap::from([
+                    (
+                        SsmKey::new(Region::new("us-west-2"), "test1-parameter-name".to_string()),
+                        "test1-parameter-value-new".to_string(),
+                    ),
+                    (
+                        SsmKey::new(Region::new("us-west-2"), "test2-parameter-name".to_string()),
+                        "test2-parameter-value-new".to_string(),
+                    ),
+                ]),
+            ),
+            (
+                Region::new("us-east-1"),
+                HashMap::from([
+                    (
+                        SsmKey::new(Region::new("us-east-1"), "test3-parameter-name".to_string()),
+                        "test3-parameter-value".to_string(),
+                    ),
+                    (
+                        SsmKey::new(
+                            Region::new("us-east-1"),
+                            "test3-parameter-name-promoted".to_string(),
+                        ),
+                        "test3-parameter-value".to_string(),
+                    ),
+                ]),
+            ),
+        ]);
+        assert_eq!(map, expected_map);
+    }
+}
